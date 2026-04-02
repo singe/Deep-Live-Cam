@@ -1,13 +1,15 @@
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import insightface
 import threading
 import numpy as np
+import onnxruntime
 import platform
 import modules.globals
 import modules.processors.frame.core
 from modules.core import update_status
 from modules.face_analyser import get_one_face, get_many_faces, default_source_face
+from modules.swap_models import get_swap_model, resolve_swap_model_id
 from modules.typing import Face, Frame
 from modules.utilities import (
     conditional_download,
@@ -21,6 +23,7 @@ from collections import deque
 import time
 
 FACE_SWAPPER = None
+FACE_SWAPPER_MODEL_ID = None
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-SWAPPER"
 
@@ -43,30 +46,203 @@ models_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(abs_dir))), "models"
 )
 
+ARCFACE_128_TEMPLATE = np.array([
+    [0.36167656, 0.40387734],
+    [0.63696719, 0.40235469],
+    [0.50019687, 0.56044219],
+    [0.38710391, 0.72160547],
+    [0.61507734, 0.72034453],
+], dtype=np.float32)
+
+
+def _get_selected_swap_model() -> Dict[str, object]:
+    selected_model = _get_selected_swap_model_id()
+    return get_swap_model(selected_model, modules.globals.execution_providers)
+
+
+def _get_selected_swap_model_id() -> str:
+    selected_model = resolve_swap_model_id(
+        modules.globals.face_swap_model, modules.globals.execution_providers
+    )
+    if (
+        selected_model == "inswapper_128_fp16"
+        and IS_APPLE_SILICON
+        and "CoreMLExecutionProvider" in modules.globals.execution_providers
+    ):
+        selected_model = "inswapper_128"
+    return selected_model
+
+
+def _build_execution_providers() -> List[Any]:
+    providers_config: List[Any] = []
+    for provider in modules.globals.execution_providers:
+        if provider == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
+            providers_config.append((
+                "CoreMLExecutionProvider",
+                {
+                    "ModelFormat": "MLProgram",
+                    "MLComputeUnits": "ALL",
+                    "SpecializationStrategy": "FastPrediction",
+                    "AllowLowPrecisionAccumulationOnGPU": 1,
+                    "EnableOnSubgraphs": 1,
+                    "RequireStaticShapes": 0,
+                    "MaximumCacheSize": 1024 * 1024 * 512,
+                },
+            ))
+        else:
+            providers_config.append(provider)
+    return providers_config
+
+
+def _get_face_landmarks_5(face: Face) -> Optional[np.ndarray]:
+    if hasattr(face, "kps") and face.kps is not None and len(face.kps) >= 5:
+        return face.kps.astype(np.float32)
+    if hasattr(face, "landmark_2d_106") and face.landmark_2d_106 is not None:
+        lm106 = face.landmark_2d_106
+        if len(lm106) >= 89:
+            return np.array([
+                lm106[38],
+                lm106[88],
+                lm106[86],
+                lm106[52],
+                lm106[61],
+            ], dtype=np.float32)
+    return None
+
+
+def _warp_face_by_template(frame: Frame, face: Face, size: Tuple[int, int]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    landmarks = _get_face_landmarks_5(face)
+    if landmarks is None:
+        return None, None
+
+    template = ARCFACE_128_TEMPLATE * np.array([size[0], size[1]], dtype=np.float32)
+    affine_matrix = cv2.estimateAffinePartial2D(landmarks, template, method=cv2.LMEDS)[0]
+    if affine_matrix is None:
+        return None, None
+
+    crop_frame = cv2.warpAffine(
+        frame,
+        affine_matrix,
+        size,
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return crop_frame, affine_matrix
+
+
+def _create_feathered_mask(size: Tuple[int, int]) -> np.ndarray:
+    width, height = size
+    mask = np.ones((height, width), dtype=np.float32)
+    border = max(1, min(width, height) // 16)
+    ramp = np.linspace(0, 1, border, dtype=np.float32)
+    mask[:border, :] = np.minimum(mask[:border, :], ramp[:, np.newaxis])
+    mask[-border:, :] = np.minimum(mask[-border:, :], ramp[::-1][:, np.newaxis])
+    mask[:, :border] = np.minimum(mask[:, :border], ramp[np.newaxis, :])
+    mask[:, -border:] = np.minimum(mask[:, -border:], ramp[::-1][np.newaxis, :])
+    return cv2.GaussianBlur(mask, (0, 0), max(1, border // 2))
+
+
+def _paste_swapped_crop(frame: Frame, swapped_crop: np.ndarray, affine_matrix: np.ndarray) -> Frame:
+    inverse_matrix = cv2.invertAffineTransform(affine_matrix)
+    frame_height, frame_width = frame.shape[:2]
+    crop_height, crop_width = swapped_crop.shape[:2]
+    mask = _create_feathered_mask((crop_width, crop_height))
+
+    warped_crop = cv2.warpAffine(
+        swapped_crop,
+        inverse_matrix,
+        (frame_width, frame_height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    warped_mask = cv2.warpAffine(
+        mask,
+        inverse_matrix,
+        (frame_width, frame_height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    mask_3ch = warped_mask[:, :, np.newaxis]
+    blended = (
+        warped_crop.astype(np.float32) * mask_3ch
+        + frame.astype(np.float32) * (1.0 - mask_3ch)
+    )
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+class HyperSwapFaceSwapper:
+    def __init__(self, model_path: str, model_info: Dict[str, object], providers: List[Any]) -> None:
+        self.model_path = model_path
+        self.model_info = model_info
+        self.size = tuple(model_info["size"])
+        self.mean = np.asarray(model_info["mean"], dtype=np.float32)
+        self.std = np.asarray(model_info["std"], dtype=np.float32)
+        self.session = onnxruntime.InferenceSession(model_path, providers=providers)
+
+    def _prepare_target(self, crop_frame: np.ndarray) -> np.ndarray:
+        prepared = crop_frame[:, :, ::-1].astype(np.float32) / 255.0
+        prepared = (prepared - self.mean) / self.std
+        return np.expand_dims(prepared.transpose(2, 0, 1), axis=0).astype(np.float32)
+
+    def _prepare_source(self, source_face: Face) -> Optional[np.ndarray]:
+        embedding = getattr(source_face, "normed_embedding", None)
+        if embedding is None:
+            return None
+        return embedding.reshape((1, -1)).astype(np.float32)
+
+    def _normalize_output(self, output: np.ndarray) -> np.ndarray:
+        if output.ndim == 4:
+            output = output[0]
+        image = output.transpose(1, 2, 0)
+        image = image * self.std + self.mean
+        image = np.clip(image, 0, 1)
+        return (image[:, :, ::-1] * 255.0).astype(np.uint8)
+
+    def get(self, frame: Frame, target_face: Face, source_face: Face, paste_back: bool = True) -> np.ndarray:
+        if not paste_back:
+            raise ValueError("HyperSwapFaceSwapper only supports paste_back=True")
+
+        source_embedding = self._prepare_source(source_face)
+        if source_embedding is None:
+            return frame
+
+        crop_frame, affine_matrix = _warp_face_by_template(frame, target_face, self.size)
+        if crop_frame is None or affine_matrix is None:
+            return frame
+
+        target_input = self._prepare_target(crop_frame)
+        input_feed = {}
+        for input_info in self.session.get_inputs():
+            if input_info.name == "target":
+                input_feed[input_info.name] = target_input
+            elif input_info.name == "source":
+                input_feed[input_info.name] = source_embedding
+
+        output = self.session.run(None, input_feed)[0]
+        swapped_crop = self._normalize_output(output)
+        return _paste_swapped_crop(frame, swapped_crop, affine_matrix)
+
+
 def pre_check() -> bool:
-    # Use models_dir instead of abs_dir to save to the correct location
     download_directory_path = models_dir
-    
-    # Make sure the models directory exists, catch permission errors if they occur
+    model_info = _get_selected_swap_model()
+    model_url = str(model_info["download_url"])
+
     try:
         os.makedirs(download_directory_path, exist_ok=True)
     except OSError as e:
-        logging.error(f"Failed to create directory {download_directory_path} due to permission error: {e}")
+        update_status(f"Failed to create model directory: {e}", NAME)
         return False
-    
-    # Use the direct download URL from Hugging Face
-    conditional_download(
-        download_directory_path,
-        [
-            "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx"
-        ],
-    )
+
+    conditional_download(download_directory_path, [model_url])
     return True
 
 
 def pre_start() -> bool:
-    # Simplified pre_start, assuming checks happen before calling process functions
-    model_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
+    model_info = _get_selected_swap_model()
+    model_path = os.path.join(models_dir, str(model_info["filename"]))
     if not os.path.exists(model_path):
         update_status(f"Model not found: {model_path}. Please download it.", NAME)
         return False
@@ -81,44 +257,40 @@ def pre_start() -> bool:
 
 
 def get_face_swapper() -> Any:
-    global FACE_SWAPPER
+    global FACE_SWAPPER, FACE_SWAPPER_MODEL_ID
+    model_info = _get_selected_swap_model()
+    selected_model_id = _get_selected_swap_model_id()
+    runtime = str(model_info["runtime"])
 
     with THREAD_LOCK:
-        if FACE_SWAPPER is None:
-            model_name = "inswapper_128.onnx"
-            if "CUDAExecutionProvider" in modules.globals.execution_providers:
-                model_name = "inswapper_128_fp16.onnx"
-            model_path = os.path.join(models_dir, model_name)
-            update_status(f"Loading face swapper model from: {model_path}", NAME)
+        if FACE_SWAPPER is None or FACE_SWAPPER_MODEL_ID != selected_model_id:
+            model_path = os.path.join(models_dir, str(model_info["filename"]))
+            providers_config = _build_execution_providers()
+            update_status(
+                f"Loading face swapper model {selected_model_id} from: {model_path}",
+                NAME,
+            )
             try:
-                # Optimized provider configuration for Apple Silicon
-                providers_config = []
-                for p in modules.globals.execution_providers:
-                    if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
-                        # Enhanced CoreML configuration for M1-M5
-                        providers_config.append((
-                            "CoreMLExecutionProvider",
-                            {
-                                "ModelFormat": "MLProgram",
-                                "MLComputeUnits": "ALL",  # Use Neural Engine + GPU + CPU
-                                "SpecializationStrategy": "FastPrediction",
-                                "AllowLowPrecisionAccumulationOnGPU": 1,
-                                "EnableOnSubgraphs": 1,
-                                "RequireStaticShapes": 0,
-                                "MaximumCacheSize": 1024 * 1024 * 512,  # 512MB cache
-                            }
-                        ))
-                    else:
-                        providers_config.append(p)
-                
-                FACE_SWAPPER = insightface.model_zoo.get_model(
-                    model_path,
-                    providers=providers_config,
-                )
-                update_status("Face swapper model loaded successfully.", NAME)
+                if runtime == "hyperswap":
+                    FACE_SWAPPER = HyperSwapFaceSwapper(model_path, model_info, providers_config)
+                    update_status(
+                        f"Face swapper model loaded successfully via ONNXRuntime ({selected_model_id}).",
+                        NAME,
+                    )
+                else:
+                    FACE_SWAPPER = insightface.model_zoo.get_model(
+                        model_path,
+                        providers=providers_config,
+                    )
+                    update_status(
+                        f"Face swapper model loaded successfully via InsightFace ({selected_model_id}).",
+                        NAME,
+                    )
+                FACE_SWAPPER_MODEL_ID = selected_model_id
             except Exception as e:
                 update_status(f"Error loading face swapper model: {e}", NAME)
                 FACE_SWAPPER = None
+                FACE_SWAPPER_MODEL_ID = None
                 return None
     return FACE_SWAPPER
 

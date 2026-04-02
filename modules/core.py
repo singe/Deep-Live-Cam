@@ -21,6 +21,7 @@ import tensorflow
 
 import modules.globals
 import modules.metadata
+from modules.swap_models import DEFAULT_SWAP_MODEL, SWAP_MODEL_CHOICES
 import modules.ui as ui
 from modules.processors.frame.core import get_frame_processors_modules
 from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
@@ -55,6 +56,7 @@ def parse_args() -> None:
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
     program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
+    program.add_argument('--swap-model', help='face swap model', dest='swap_model', default=DEFAULT_SWAP_MODEL, choices=SWAP_MODEL_CHOICES)
     program.add_argument('-v', '--version', action='version', version=f'{modules.metadata.name} {modules.metadata.version}')
 
     # register deprecated args
@@ -84,6 +86,7 @@ def parse_args() -> None:
     modules.globals.max_memory = args.max_memory
     modules.globals.execution_providers = decode_execution_providers(args.execution_provider)
     modules.globals.execution_threads = args.execution_threads
+    modules.globals.face_swap_model = args.swap_model
     modules.globals.lang = args.lang
 
     #for ENHANCER tumblers:

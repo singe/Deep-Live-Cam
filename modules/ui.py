@@ -33,6 +33,11 @@ from modules.utilities import (
 )
 from modules.video_capture import VideoCapturer
 from modules.gettext import LanguageManager
+from modules.swap_models import (
+    DEFAULT_SWAP_MODEL,
+    SWAP_MODEL_LABELS,
+    SWAP_MODEL_LABEL_TO_ID,
+)
 from modules.ui_tooltip import ToolTip
 from modules import globals
 import platform
@@ -138,6 +143,7 @@ def save_switch_states():
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
         "mouth_mask_size": modules.globals.mouth_mask_size,
+        "face_swap_model": modules.globals.face_swap_model,
     }
     with open("switch_states.json", "w") as f:
         json.dump(switch_states, f)
@@ -160,6 +166,7 @@ def load_switch_states():
         modules.globals.fp_ui = switch_states.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = switch_states.get("show_fps", False)
         modules.globals.mouth_mask_size = switch_states.get("mouth_mask_size", 0.0)
+        modules.globals.face_swap_model = switch_states.get("face_swap_model", DEFAULT_SWAP_MODEL)
         # mouth_mask is driven by the slider: on if size > 0, off if 0
         modules.globals.mouth_mask = modules.globals.mouth_mask_size > 0
         modules.globals.show_mouth_mask_box = False  # always start hidden
@@ -342,24 +349,24 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     start_button = ctk.CTkButton(
         root, text=_("Start"), cursor="hand2", command=lambda: analyze_target(start, root)
     )
-    start_button.place(relx=0.15, rely=0.78, relwidth=0.2, relheight=0.04)
+    start_button.place(relx=0.15, rely=0.80, relwidth=0.2, relheight=0.04)
     ToolTip(start_button, _("Begin processing the target image/video with selected face"))
 
     stop_button = ctk.CTkButton(
         root, text=_("Destroy"), cursor="hand2", command=lambda: destroy()
     )
-    stop_button.place(relx=0.4, rely=0.78, relwidth=0.2, relheight=0.04)
+    stop_button.place(relx=0.4, rely=0.80, relwidth=0.2, relheight=0.04)
     ToolTip(stop_button, _("Stop processing and close the application"))
 
     preview_button = ctk.CTkButton(
         root, text=_("Preview"), cursor="hand2", command=lambda: toggle_preview()
     )
-    preview_button.place(relx=0.65, rely=0.78, relwidth=0.2, relheight=0.04)
+    preview_button.place(relx=0.65, rely=0.80, relwidth=0.2, relheight=0.04)
     ToolTip(preview_button, _("Show/hide a preview of the processed output"))
 
     # --- Camera Selection ---
     camera_label = ctk.CTkLabel(root, text=_("Select Camera:"))
-    camera_label.place(relx=0.1, rely=0.83, relwidth=0.2, relheight=0.03)
+    camera_label.place(relx=0.1, rely=0.85, relwidth=0.2, relheight=0.03)
 
     available_cameras = get_available_cameras()
     camera_indices, camera_names = available_cameras
@@ -378,7 +385,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
             root, variable=camera_variable, values=camera_names
         )
 
-    camera_optionmenu.place(relx=0.35, rely=0.83, relwidth=0.25, relheight=0.03)
+    camera_optionmenu.place(relx=0.35, rely=0.85, relwidth=0.25, relheight=0.03)
     ToolTip(camera_optionmenu, _("Select which camera to use for live mode"))
 
     live_button = ctk.CTkButton(
@@ -399,7 +406,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
             else "disabled"
         ),
     )
-    live_button.place(relx=0.65, rely=0.83, relwidth=0.2, relheight=0.03)
+    live_button.place(relx=0.65, rely=0.85, relwidth=0.2, relheight=0.03)
     ToolTip(live_button, _("Start real-time face swap using webcam"))
     # --- End Camera Selection ---
 
@@ -434,7 +441,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         save_switch_states()
 
     enhancer_label = ctk.CTkLabel(root, text="Face Enhancer:")
-    enhancer_label.place(relx=0.1, rely=0.62, relwidth=0.2, relheight=0.03)
+    enhancer_label.place(relx=0.1, rely=0.65, relwidth=0.2, relheight=0.03)
 
     enhancer_dropdown = ctk.CTkOptionMenu(
         root,
@@ -442,8 +449,31 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         values=enhancer_options,
         command=on_enhancer_change,
     )
-    enhancer_dropdown.place(relx=0.35, rely=0.62, relwidth=0.3, relheight=0.03)
+    enhancer_dropdown.place(relx=0.35, rely=0.65, relwidth=0.3, relheight=0.03)
     ToolTip(enhancer_dropdown, _("Select a face enhancement model (None = no enhancement)"))
+
+    swap_model_labels = list(SWAP_MODEL_LABEL_TO_ID.keys())
+    initial_swap_model_label = SWAP_MODEL_LABELS.get(
+        modules.globals.face_swap_model, SWAP_MODEL_LABELS[DEFAULT_SWAP_MODEL]
+    )
+    swap_model_variable = ctk.StringVar(value=initial_swap_model_label)
+
+    def on_swap_model_change(choice: str):
+        modules.globals.face_swap_model = SWAP_MODEL_LABEL_TO_ID.get(choice, DEFAULT_SWAP_MODEL)
+        save_switch_states()
+        update_status(f"Face swap model set to {choice}")
+
+    swap_model_label = ctk.CTkLabel(root, text="Swap Model:")
+    swap_model_label.place(relx=0.1, rely=0.61, relwidth=0.2, relheight=0.03)
+
+    swap_model_dropdown = ctk.CTkOptionMenu(
+        root,
+        variable=swap_model_variable,
+        values=swap_model_labels,
+        command=on_swap_model_change,
+    )
+    swap_model_dropdown.place(relx=0.35, rely=0.61, relwidth=0.3, relheight=0.03)
+    ToolTip(swap_model_dropdown, _("Select the face swap model"))
 
     # 1) Define a DoubleVar for transparency (0 = fully transparent, 1 = fully opaque)
     transparency_var = ctk.DoubleVar(value=1.0)
@@ -466,7 +496,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
 
     # 2) Transparency label and slider
     transparency_label = ctk.CTkLabel(root, text="Transparency:")
-    transparency_label.place(relx=0.15, rely=0.66, relwidth=0.2, relheight=0.03)
+    transparency_label.place(relx=0.15, rely=0.69, relwidth=0.2, relheight=0.03)
 
     transparency_slider = ctk.CTkSlider(
         root,
@@ -482,7 +512,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         border_width=1,
         corner_radius=3,
     )
-    transparency_slider.place(relx=0.35, rely=0.67, relwidth=0.5, relheight=0.02)
+    transparency_slider.place(relx=0.35, rely=0.70, relwidth=0.5, relheight=0.02)
     ToolTip(transparency_slider, _("Blend between original and swapped face (0% = original, 100% = fully swapped)"))
 
     # 3) Sharpness label & slider
@@ -492,7 +522,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         update_status(f"Sharpness set to {value:.1f}")
 
     sharpness_label = ctk.CTkLabel(root, text="Sharpness:")
-    sharpness_label.place(relx=0.15, rely=0.69, relwidth=0.2, relheight=0.03)
+    sharpness_label.place(relx=0.15, rely=0.72, relwidth=0.2, relheight=0.03)
 
     sharpness_slider = ctk.CTkSlider(
         root,
@@ -508,7 +538,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         border_width=1,
         corner_radius=3,
     )
-    sharpness_slider.place(relx=0.35, rely=0.70, relwidth=0.5, relheight=0.02)
+    sharpness_slider.place(relx=0.35, rely=0.73, relwidth=0.5, relheight=0.02)
     ToolTip(sharpness_slider, _("Sharpen the enhanced face output"))
 
     # 4) Mouth Mask Size slider
@@ -536,7 +566,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
             modules.globals.show_mouth_mask_box = True
 
     mouth_mask_size_label = ctk.CTkLabel(root, text="Mouth Mask:")
-    mouth_mask_size_label.place(relx=0.15, rely=0.72, relwidth=0.2, relheight=0.03)
+    mouth_mask_size_label.place(relx=0.15, rely=0.75, relwidth=0.2, relheight=0.03)
 
     mouth_mask_size_slider = ctk.CTkSlider(
         root,
@@ -552,7 +582,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         border_width=1,
         corner_radius=3,
     )
-    mouth_mask_size_slider.place(relx=0.35, rely=0.73, relwidth=0.5, relheight=0.02)
+    mouth_mask_size_slider.place(relx=0.35, rely=0.76, relwidth=0.5, relheight=0.02)
     mouth_mask_size_slider.bind("<ButtonPress-1>", on_mouth_mask_slider_press)
     mouth_mask_size_slider.bind("<ButtonRelease-1>", on_mouth_mask_slider_release)
     ToolTip(mouth_mask_size_slider, _("0 = use swapped mouth, 100 = expose original mouth to chin area"))
@@ -560,12 +590,12 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     # Status and link at the bottom
     global status_label
     status_label = ctk.CTkLabel(root, text=None, justify="center")
-    status_label.place(relx=0.1, rely=0.75, relwidth=0.8)
+    status_label.place(relx=0.1, rely=0.78, relwidth=0.8)
 
     donate_label = ctk.CTkLabel(
         root, text="Deep Live Cam", justify="center", cursor="hand2"
     )
-    donate_label.place(relx=0.1, rely=0.87, relwidth=0.8)
+    donate_label.place(relx=0.1, rely=0.90, relwidth=0.8)
     donate_label.configure(
         text_color=ctk.ThemeManager.theme.get("URL").get("text_color")
     )

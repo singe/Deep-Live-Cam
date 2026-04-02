@@ -126,8 +126,13 @@ cd Deep-Live-Cam
 
 1. [GFPGANv1.4](https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx)
 2. [inswapper\_128\_fp16.onnx](https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx)
+3. Optional HyperSwap models:
+   - [hyperswap\_1a\_256.onnx](https://github.com/facefusion/facefusion-assets/releases/download/models-3.3.0/hyperswap_1a_256.onnx)
+   - [hyperswap\_1b\_256.onnx](https://github.com/facefusion/facefusion-assets/releases/download/models-3.3.0/hyperswap_1b_256.onnx)
 
 Place these files in the "**models**" folder.
+
+The app can also auto-download the selected face swap model when it is missing.
 
 **4. Install Dependencies**
 
@@ -210,6 +215,12 @@ pip install onnxruntime-gpu==1.21.0
 python run.py --execution-provider cuda
 ```
 
+To select a specific face swap model:
+
+```bash
+python run.py --execution-provider cuda --swap-model hyperswap_1a_256
+```
+
 **CoreML Execution Provider (Apple Silicon)**
 
 Apple Silicon (M1/M2/M3) specific installation:
@@ -226,6 +237,12 @@ pip install onnxruntime-silicon==1.13.1
 
 ```bash
 python3.10 run.py --execution-provider coreml
+```
+
+To select a specific face swap model:
+
+```bash
+python3.10 run.py --execution-provider coreml --swap-model hyperswap_1a_256
 ```
 
 **Important Notes for macOS:**
